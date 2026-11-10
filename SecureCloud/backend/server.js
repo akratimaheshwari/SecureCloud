@@ -11,6 +11,13 @@ try {
 const app = require('./app');
 const { connectDB, disconnectDB } = require('./db/db');
 
+app.get("/", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "SecureCloud Backend is running"
+  });
+}); 
+
 (async () => {
   await connectDB(); // exits the process if MongoDB is unreachable
 
