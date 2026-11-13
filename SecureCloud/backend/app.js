@@ -33,6 +33,12 @@ if (env.nodeEnv !== 'test') {
 app.use(express.json({ limit: '100kb' }));
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'SecureCloud Backend is running'
+  });
+});
 app.use('/api', apiLimiter, routes);
 
 app.use(notFound);
