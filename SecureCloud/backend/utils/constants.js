@@ -6,6 +6,14 @@ module.exports = Object.freeze({
   // Keep in sync with models/File.js (ordered low -> high sensitivity)
   CLASSIFICATIONS: ['PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'HIGHLY_CONFIDENTIAL'],
   SEVERITIES: ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'],
+  // Single source of truth for File.status (models/File.js and validators use this list).
+  FILE_STATUSES: ['UPLOADING', 'SCANNING', 'ACTIVE', 'RESTRICTED', 'LOCKED', 'QUARANTINED', 'DELETED'],
+  // Statuses a DLP decision can produce, ordered least -> most restrictive.
+  // SECURITY: transitions between these may only move to the RIGHT automatically (see dlpPolicyService).
+  DLP_STATUS_ORDER: ['ACTIVE', 'RESTRICTED', 'QUARANTINED'],
+  // Where a file whose format the scanner cannot read ends up. Unsupported != clean, so it never
+  // becomes ACTIVE on its own: RESTRICTED = owner-only download, sharing blocked, until reviewed.
+  UNSUPPORTED_SCAN_STATUS: 'RESTRICTED',
   EVENT_SEVERITIES: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'],
   EVENT_TYPES: [
     'BLOCKED_SHARE', 'WARNED_SHARE', 'FAILED_LOGIN', 'UNAUTHORIZED_ACCESS', 'EXPIRED_LINK_ACCESS',
@@ -29,6 +37,10 @@ module.exports = Object.freeze({
     UNKNOWN_RECIPIENT: 20,
     TRUSTED_APPROVED_ACTION: -10,
   }),
+  // Minimum risk score implied by the DLP severity, aligned with the riskLevel bands
+  // (Low 0-30, Medium 31-60, High 61-80, Critical 81-100). Without it a CRITICAL file could
+  // score only 50 (flat +30 content, +20 classification), contradicting its own severity.
+  SEVERITY_RISK_FLOOR: Object.freeze({ NONE: 0, LOW: 10, MEDIUM: 31, HIGH: 61, CRITICAL: 81 }),
   HIGH_RISK_THRESHOLD: 61, // >= this on upload creates a HIGH_RISK_UPLOAD event
 
   // --- Download abuse ---

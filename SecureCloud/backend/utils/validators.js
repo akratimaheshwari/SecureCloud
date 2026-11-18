@@ -29,19 +29,23 @@ const schemas = {
   // ---- files ----
   uploadUrl: Joi.object({
     fileName: Joi.string().trim().min(1).max(255).required(),
-    fileType: Joi.string().trim().pattern(/^[\w.+-]+\/[\w.+-]+$/).max(127).required(),
+    fileType: (env.allowedMimeTypes
+      ? Joi.string().trim().lowercase().valid(...env.allowedMimeTypes)
+      : Joi.string().trim()
+    ).pattern(/^[\w.+-]+\/[\w.+-]+$/).max(127).required(),
     size: Joi.number().integer().min(1).max(env.maxFileSizeBytes).required(),
   }),
   listFiles: Joi.object({
     page, limit: limit(),
     q: Joi.string().trim().max(100),
     classification: Joi.string().valid('PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'HIGHLY_CONFIDENTIAL'),
-    status: Joi.string().valid('UPLOADING', 'SCANNING', 'ACTIVE', 'LOCKED', 'QUARANTINED'),
+    status: Joi.string().valid('UPLOADING', 'SCANNING', 'ACTIVE', 'RESTRICTED', 'LOCKED', 'QUARANTINED'),
   }),
   confirmUpload: Joi.object({
     sha256Hash: Joi.string().lowercase().pattern(/^[a-f0-9]{64}$/),
   }).default({}),
   lockFile: Joi.object({ reason: Joi.string().trim().max(500) }),
+  releaseFile: Joi.object({ note: Joi.string().trim().max(500) }),
 
   // ---- shares ----
   createShare: Joi.object({

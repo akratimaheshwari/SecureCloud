@@ -36,6 +36,7 @@ async function evaluate({ file, recipientEmail, owner, req = null, record = true
   const risk = riskService.calculateRisk({
     detectedTypes: dlp ? dlp.detectedTypes : [],
     classification: file.classification,
+    severity: file.dlpSeverity, // keeps share risk consistent with the DLP verdict
     isExternal,
     recentDownloads,
     recipientKnown: recipientRegistered,
@@ -45,11 +46,13 @@ async function evaluate({ file, recipientEmail, owner, req = null, record = true
   let reason;
   let policy = null;
 
-  if (file.status === 'LOCKED' || file.status === 'QUARANTINED') {
+  if (file.status !== 'ACTIVE') {
+    // Only ACTIVE files can be shared. RESTRICTED/QUARANTINED come from the DLP policy, LOCKED from an admin.
     decision = 'BLOCK';
-    reason = file.status === 'QUARANTINED'
-      ? 'File is quarantined due to a scan failure; sharing blocked'
-      : `File is locked${file.lockReason ? `: ${file.lockReason}` : ''}`;
+    if (file.status === 'QUARANTINED') reason = 'File is quarantined by DLP policy pending security review; sharing blocked';
+    else if (file.status === 'RESTRICTED') reason = 'File is restricted by DLP policy; sharing blocked';
+    else if (file.status === 'LOCKED') reason = `File is locked${file.lockReason ? `: ${file.lockReason}` : ''}`;
+    else reason = `File is not available for sharing (status ${file.status})`;
   } else {
     const policies = await SecurityPolicy.find({ enabled: true }).lean();
     const hit = selectPolicy(policies, { classification: file.classification, isExternal, recentDownloads });

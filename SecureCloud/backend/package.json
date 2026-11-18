@@ -9,6 +9,7 @@
     "dev": "node --watch server.js",
     "seed": "node db/seed/seed.js",
     "seed:reset": "node db/seed/seed.js --reset",
+    "migrate:reconcile": "node db/migrations/reconcile-file-status.js",
     "test": "node --test"
   },
   "dependencies": {

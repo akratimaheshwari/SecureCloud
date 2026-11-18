@@ -13,6 +13,7 @@ const auditService = require('../services/auditService');
 const policyService = require('../services/policyService');
 const riskService = require('../services/riskService');
 const shareService = require('../services/shareService');
+const fileSecurityService = require('../services/fileSecurityService');
 const suspiciousService = require('../services/suspiciousService');
 const securityEventService = require('../services/securityEventService');
 const { getFileForUser } = require('../services/fileAccessService');
@@ -24,7 +25,8 @@ const createShare = asyncHandler(async (req, res) => {
   const { fileId, recipientEmail, expiresInHours, maxDownloads } = req.body;
 
   const file = await getFileForUser(req, fileId); // owner only
-  if (!['ACTIVE', 'LOCKED'].includes(file.status)) {
+  // RESTRICTED is let through only so the policy engine records a BLOCKED_SHARE for the attempt
+  if (!['ACTIVE', 'LOCKED', 'RESTRICTED'].includes(file.status)) {
     throw new ApiError(409, `File is not ready to be shared (status: ${file.status}). Wait for the DLP scan to finish.`, 'FILE_NOT_READY');
   }
   if (recipientEmail === req.user.email) throw new ApiError(400, 'You cannot share a file with yourself', 'INVALID_RECIPIENT');
@@ -126,6 +128,7 @@ const accessShare = asyncHandler(async (req, res) => {
 
   const verdict = policyService.evaluateLinkAccess({ link, file });
   if (!verdict.allowed) return deny(verdict);
+  await fileSecurityService.verifyObjectIntegrity(file, req); // before consuming a download: object replaced after the scan => quarantine
 
   // Atomic increment: the filter re-checks every condition, so two parallel requests can never exceed maxDownloads.
   const updated = await SharingLink.findOneAndUpdate(
@@ -199,7 +202,7 @@ async function loadPending(id) {
 const approveShare = asyncHandler(async (req, res) => {
   const link = await loadPending(req.params.id);
   const file = await File.findById(link.fileId);
-  if (!file || ['DELETED', 'LOCKED'].includes(file.status)) throw new ApiError(409, 'The file is no longer available for sharing', 'INVALID_STATE');
+  if (!file || file.status !== 'ACTIVE') throw new ApiError(409, 'The file is no longer available for sharing', 'INVALID_STATE'); // never approve a RESTRICTED/QUARANTINED file
   if (shareService.isExpired(link)) throw new ApiError(409, 'The link has already expired; ask the owner to create a new share', 'LINK_EXPIRED');
 
   const risk = riskService.applyTrustedApproval(link.riskScoreAtShare);

@@ -9,7 +9,10 @@ const { sendSuccess } = require('../utils/response');
 const { parsePagination, pageMeta } = require('../utils/pagination');
 const { escapeRegex, sanitizeFileName } = require('../utils/strings');
 const { serializeFile } = require('../utils/serializers');
+const env = require('../config/env');
 const { DOWNLOAD_URL_TTL_SECONDS } = require('../utils/constants');
+const policy = require('../services/dlpPolicyService');
+const fileSecurityService = require('../services/fileSecurityService');
 const s3Service = require('../services/s3Service');
 const auditService = require('../services/auditService');
 const suspiciousService = require('../services/suspiciousService');
@@ -30,7 +33,19 @@ const createUploadUrl = asyncHandler(async (req, res) => {
   return sendSuccess(res, { fileId, uploadUrl, method: 'PUT', headers, expiresIn }, 201);
 });
 
+// True when the configured customer-managed key (if any) is the one S3 reports. Aliases cannot be
+// compared against the key ARN S3 returns, so only key ids / ARNs are enforced.
+function kmsKeyMatches(head) {
+  const wanted = env.s3KmsKeyId;
+  if (!wanted || wanted.startsWith('alias/') || !head.kmsKeyId) return true;
+  return String(head.kmsKeyId).endsWith(wanted);
+}
+
 // POST /api/files/:id/confirm  (client calls this after the PUT to S3 succeeded)
+// Moves UPLOADING -> SCANNING atomically, then asks the central DLP policy for the real status. If the
+// Lambda already reported (it can finish first) the policy applies that result now; otherwise the Lambda
+// callback applies it later. Both orders end in the same status. A file never becomes ACTIVE here
+// just because a scan exists: CRITICAL -> QUARANTINED, HIGH -> RESTRICTED, FAILED -> QUARANTINED.
 const confirmUpload = asyncHandler(async (req, res) => {
   const file = await getFileForUser(req, req.params.id);
   if (file.status !== 'UPLOADING') throw new ApiError(409, `Upload already confirmed (status: ${file.status})`, 'INVALID_STATE');
@@ -38,53 +53,41 @@ const confirmUpload = asyncHandler(async (req, res) => {
   const head = await s3Service.headObject(file.s3Key);
   if (!head) throw new ApiError(400, 'No uploaded object found. PUT the file to the pre-signed URL first.', 'UPLOAD_NOT_FOUND');
 
-  // Enforce encryption at rest: anything not SSE-KMS encrypted is removed.
-  if (!String(head.serverSideEncryption || '').startsWith('aws:kms')) {
+  // Reject = remove the object and the file record (only while still UPLOADING), then fail the request.
+  const reject = async (code, message, reason) => {
     await s3Service.deleteObject(file.s3Key).catch((e) => console.error('[s3] cleanup failed:', e.message));
-    file.status = 'DELETED';
-    await file.save();
-    await auditService.log(req, 'UPLOAD_REJECTED', { type: 'File', id: file._id }, { reason: 'not encrypted with SSE-KMS' });
-    throw new ApiError(400, 'Object was not encrypted with SSE-KMS and has been removed', 'ENCRYPTION_REQUIRED');
+    await File.updateOne({ _id: file._id, status: 'UPLOADING' }, { $set: { status: 'DELETED' } });
+    await auditService.log(req, 'UPLOAD_REJECTED', { type: 'File', id: file._id }, { reason });
+    throw new ApiError(400, message, code);
+  };
+
+  // Enforce encryption at rest: anything not SSE-KMS (or under the wrong key) is removed.
+  if (!String(head.serverSideEncryption || '').startsWith('aws:kms') || !kmsKeyMatches(head)) {
+    await reject('ENCRYPTION_REQUIRED', 'Object was not encrypted with the required SSE-KMS key and has been removed', 'not encrypted with the required SSE-KMS key');
+  }
+  // The signed Content-Length should make this impossible; verify anyway so size limits cannot be bypassed.
+  if (head.contentLength > env.maxFileSizeBytes || head.contentLength !== file.size) {
+    await reject('SIZE_MISMATCH', 'Uploaded object size does not match the declared size or exceeds the limit and has been removed', 'size mismatch or over limit');
   }
 
-  file.size = head.contentLength ?? file.size;
-  if (req.body && req.body.sha256Hash) {
-    file.sha256Hash = req.body.sha256Hash;
-  }
+  const $set = { status: 'SCANNING', size: head.contentLength, s3ETag: head.eTag };
+  // A client hash is only a hint; the scanner's SHA-256 overwrites it (see saveScanResult)
+  if (req.body && req.body.sha256Hash && !file.sha256Hash) $set.sha256Hash = req.body.sha256Hash;
 
-  // The S3-triggered Lambda can finish before the client confirms; then the file goes straight to ACTIVE.
- const latestScan = await DlpResult.findOne({
-  fileId: file._id
-}).sort({ createdAt: -1 });
+  // Atomic claim: two parallel confirms cannot both proceed
+  const claimed = await File.findOneAndUpdate({ _id: file._id, ownerId: req.user._id, status: 'UPLOADING' }, { $set }, { new: true });
+  if (!claimed) throw new ApiError(409, 'Upload already confirmed', 'INVALID_STATE');
 
-let dlpStatus;
+  if (!(await DlpResult.exists({ fileId: file._id }))) await DlpResult.create({ fileId: file._id, scanStatus: 'PENDING' });
 
-if (
-  latestScan &&
-  ['COMPLETED', 'UNSUPPORTED'].includes(latestScan.scanStatus)
-) {
-  file.status = 'ACTIVE';
-  dlpStatus = latestScan.scanStatus;
-} else if (latestScan?.scanStatus === 'FAILED') {
-  file.status = 'QUARANTINED';
-  file.lockReason = 'DLP scan failed. Security review required.';
-  dlpStatus = 'FAILED';
-} else {
-  file.status = 'SCANNING';
-  dlpStatus = 'PENDING';
+  // If the Lambda reported before this confirm, apply its result now through the same policy as the callback.
+  const { file: current } = await fileSecurityService.reconcileStatus(file._id, { req });
+  const finalFile = current || claimed;
+  const latestScan = await fileSecurityService.latestFinishedScan(file._id);
+  const dlpStatus = latestScan ? latestScan.scanStatus : 'PENDING'; // reflects the real scan state
 
-  if (!latestScan || latestScan.scanStatus !== 'PENDING') {
-    await DlpResult.create({
-      fileId: file._id,
-      scanStatus: 'PENDING'
-    });
-  }
-}
-
-  await file.save();
-
-  await auditService.log(req, 'UPLOAD', { type: 'File', id: file._id }, { name: file.originalName, size: file.size, mimeType: file.mimeType });
-  return sendSuccess(res, { file: serializeFile(file), dlpStatus: scanned ? 'COMPLETED' : 'PENDING' });
+  await auditService.log(req, 'UPLOAD', { type: 'File', id: file._id }, { name: finalFile.originalName, size: finalFile.size, mimeType: finalFile.mimeType, status: finalFile.status });
+  return sendSuccess(res, { file: serializeFile(finalFile), dlpStatus, dlpSeverity: finalFile.dlpSeverity });
 });
 
 // GET /api/files?page=&limit=&q=&classification=&status=   (own files only, soft-deleted hidden)
@@ -110,7 +113,7 @@ const getFile = asyncHandler(async (req, res) => {
   return sendSuccess(res, { file: serializeFile(file), dlpResult });
 });
 
-// GET /api/files/:id/download-url  (owner only; LOCKED, QUARANTINED, and SCANNING files are denied)
+// GET /api/files/:id/download-url  (owner only; only ACTIVE and RESTRICTED files; LOCKED, QUARANTINED, SCANNING, UPLOADING are denied)
 const getDownloadUrl = asyncHandler(async (req, res) => {
   const file = await getFileForUser(req, req.params.id);
 
@@ -128,6 +131,11 @@ const getDownloadUrl = asyncHandler(async (req, res) => {
   }
   if (file.status === 'UPLOADING') throw new ApiError(409, 'Upload has not been confirmed yet', 'INVALID_STATE');
   if (file.status === 'SCANNING') throw new ApiError(409, 'File is undergoing DLP scanning. Please wait.', 'SCANNING_IN_PROGRESS');
+  // Whitelist: only ACTIVE and RESTRICTED (owner-only, which getFileForUser enforced) may be downloaded.
+  if (!policy.canDownload(file.status)) throw new ApiError(403, 'This file cannot be downloaded in its current state', 'FILE_NOT_AVAILABLE');
+
+  // Presigned-PUT replay guard: quarantines the file if the stored object changed after it was scanned
+  await fileSecurityService.verifyObjectIntegrity(file, req);
 
   const downloadUrl = await s3Service.createDownloadUrl({ key: file.s3Key, fileName: file.originalName });
   await auditService.log(req, 'DOWNLOAD', { type: 'File', id: file._id }, { name: file.originalName, via: 'owner' });
@@ -159,35 +167,72 @@ const deleteFile = asyncHandler(async (req, res) => {
 });
 
 // PATCH /api/files/:id/lock  (admin)
+const LOCKABLE = ['ACTIVE', 'SCANNING', 'RESTRICTED'];
 const lockFile = asyncHandler(async (req, res) => {
   const file = await File.findById(req.params.id);
   if (!file || file.status === 'DELETED') throw new ApiError(404, 'File not found', 'FILE_NOT_FOUND');
-  if (!['ACTIVE', 'SCANNING'].includes(file.status)) throw new ApiError(409, `Cannot lock a file in status ${file.status}`, 'INVALID_STATE');
+  if (!LOCKABLE.includes(file.status)) throw new ApiError(409, `Cannot lock a file in status ${file.status}`, 'INVALID_STATE');
 
-  file.status = 'LOCKED';
-  file.lockedBy = req.user._id;
-  file.lockReason = req.body.reason || 'Locked by administrator';
-  await file.save();
+  const reason = req.body.reason || 'Locked by administrator';
+  // Remember the prior status so unlock can restore it; conditional so a concurrent scan result is not overwritten
+  const locked = await File.findOneAndUpdate(
+    { _id: file._id, status: file.status },
+    { $set: { status: 'LOCKED', statusBeforeLock: file.status, lockedBy: req.user._id, lockReason: reason } },
+    { new: true },
+  );
+  if (!locked) throw new ApiError(409, 'File status changed, please retry', 'INVALID_STATE');
 
-  await auditService.log(req, 'FILE_LOCK', { type: 'File', id: file._id }, { reason: file.lockReason, ownerId: file.ownerId });
-  return sendSuccess(res, { file: serializeFile(file) });
+  await auditService.log(req, 'FILE_LOCK', { type: 'File', id: file._id }, { reason, ownerId: file.ownerId, previousStatus: file.status });
+  return sendSuccess(res, { file: serializeFile(locked) });
 });
 
 // PATCH /api/files/:id/unlock  (admin)
+// SECURITY: unlock restores the pre-lock status but never below what the DLP policy requires, so it
+// cannot turn a CRITICAL/HIGH/failed/unsupported file into an ACTIVE one.
 const unlockFile = asyncHandler(async (req, res) => {
   const file = await File.findById(req.params.id);
   if (!file || file.status === 'DELETED') throw new ApiError(404, 'File not found', 'FILE_NOT_FOUND');
   if (file.status !== 'LOCKED') throw new ApiError(409, 'File is not locked', 'INVALID_STATE');
 
-  // Back to SCANNING if the scan never finished, otherwise ACTIVE
-  const scanned = await DlpResult.exists({ fileId: file._id, scanStatus: { $in: ['COMPLETED', 'UNSUPPORTED'] } });
-  file.status = scanned ? 'ACTIVE' : 'SCANNING';
-  file.lockedBy = undefined;
-  file.lockReason = undefined;
-  await file.save();
+  const latestScan = await fileSecurityService.latestFinishedScan(file._id);
+  const floor = policy.floorStatus({ latestScan, dlpSeverity: file.dlpSeverity, reviewed: Boolean(file.reviewedAt) });
+  const target = policy.statusAfterUnlock({ before: file.statusBeforeLock, floor });
 
-  await auditService.log(req, 'FILE_UNLOCK', { type: 'File', id: file._id }, { ownerId: file.ownerId });
-  return sendSuccess(res, { file: serializeFile(file) });
+  const $set = { status: target };
+  const $unset = { lockedBy: 1, statusBeforeLock: 1 };
+  if (target === 'RESTRICTED' || target === 'QUARANTINED') $set.lockReason = `DLP policy keeps this file ${target} after unlock`;
+  else $unset.lockReason = 1;
+
+  const unlocked = await File.findOneAndUpdate({ _id: file._id, status: 'LOCKED' }, { $set, $unset }, { new: true });
+  if (!unlocked) throw new ApiError(409, 'File status changed, please retry', 'INVALID_STATE');
+  // A scan result may have arrived while locked/unlocking: re-apply the policy once more (idempotent)
+  const { file: current } = await fileSecurityService.reconcileStatus(file._id, { req });
+
+  await auditService.log(req, 'FILE_UNLOCK', { type: 'File', id: file._id }, { ownerId: file.ownerId, status: (current || unlocked).status });
+  return sendSuccess(res, { file: serializeFile(current || unlocked) });
 });
 
-module.exports = { createUploadUrl, confirmUpload, listFiles, getFile, getDownloadUrl, deleteFile, lockFile, unlockFile };
+// PATCH /api/files/:id/release  (admin) - the security review step for a QUARANTINED file.
+// Release goes to RESTRICTED (owner-only, sharing blocked), NEVER to ACTIVE. No endpoint can make a
+// file that scanned HIGH/CRITICAL (or failed/unsupported) ACTIVE.
+const releaseFile = asyncHandler(async (req, res) => {
+  const file = await File.findById(req.params.id);
+  if (!file || file.status === 'DELETED') throw new ApiError(404, 'File not found', 'FILE_NOT_FOUND');
+  if (file.status !== 'QUARANTINED') throw new ApiError(409, 'Only QUARANTINED files can be released', 'INVALID_STATE');
+
+  const head = await s3Service.headObject(file.s3Key);
+  if (!head) throw new ApiError(409, 'The stored object is missing; delete the file instead', 'OBJECT_MISSING');
+
+  const note = req.body.note || 'Released from quarantine by administrator review';
+  const released = await File.findOneAndUpdate(
+    { _id: file._id, status: 'QUARANTINED' },
+    { $set: { status: 'RESTRICTED', reviewedBy: req.user._id, reviewedAt: new Date(), lockReason: note, s3ETag: head.eTag } }, // re-baseline the reviewed object
+    { new: true },
+  );
+  if (!released) throw new ApiError(409, 'File status changed, please retry', 'INVALID_STATE');
+
+  await auditService.log(req, 'FILE_RELEASE', { type: 'File', id: file._id }, { note, ownerId: file.ownerId, newStatus: 'RESTRICTED' });
+  return sendSuccess(res, { file: serializeFile(released) });
+});
+
+module.exports = { createUploadUrl, confirmUpload, listFiles, getFile, getDownloadUrl, deleteFile, lockFile, unlockFile, releaseFile };

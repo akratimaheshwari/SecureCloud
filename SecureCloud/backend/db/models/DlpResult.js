@@ -30,10 +30,14 @@ const DlpResultSchema = new Schema(
       default: 'PENDING',
     },
     scannedAt: { type: Date },
+    // Hash of the callback content; makes retried Lambda callbacks idempotent (see dlpController).
+    payloadHash: { type: String },
   },
   { timestamps: true }
 );
 
+// One record per distinct scan payload per file. Partial, so legacy records without a hash are unaffected.
+DlpResultSchema.index({ fileId: 1, payloadHash: 1 }, { unique: true, partialFilterExpression: { payloadHash: { $type: 'string' } } });
 // Reports: recent high-severity findings
 DlpResultSchema.index({ severity: 1, createdAt: -1 });
 

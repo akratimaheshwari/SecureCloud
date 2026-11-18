@@ -18,5 +18,6 @@ router.delete('/:id', validate({ params: schemas.idParam }), ctrl.deleteFile);
 // Admin only
 router.patch('/:id/lock', authorizeRoles('admin'), validate({ params: schemas.idParam, body: schemas.lockFile }), ctrl.lockFile);
 router.patch('/:id/unlock', authorizeRoles('admin'), validate({ params: schemas.idParam }), ctrl.unlockFile);
+router.patch('/:id/release', authorizeRoles('admin'), validate({ params: schemas.idParam, body: schemas.releaseFile }), ctrl.releaseFile);
 
 module.exports = router;

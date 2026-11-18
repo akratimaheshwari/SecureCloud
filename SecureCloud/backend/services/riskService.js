@@ -1,6 +1,6 @@
 'use strict';
 // Rule-based risk score (0-100). Every point is listed in `breakdown`, so a score can always be explained.
-const { RISK_WEIGHTS: W, SENSITIVE_TYPES, DOWNLOAD_BURST_LIMIT } = require('../utils/constants');
+const { RISK_WEIGHTS: W, SENSITIVE_TYPES, DOWNLOAD_BURST_LIMIT, SEVERITY_RISK_FLOOR } = require('../utils/constants');
 
 // 0-30 Low, 31-60 Medium, 61-80 High, 81-100 Critical
 function riskLevel(score) {
@@ -16,13 +16,14 @@ const clamp = (n) => Math.max(0, Math.min(100, Math.round(n)));
  * Inputs (all optional):
  *   detectedTypes   - DLP types found in the file
  *   classification  - file classification
+ *   severity        - DLP severity (NONE..CRITICAL); raises the score to the minimum for that severity
  *   isExternal      - sharing outside the organisation
  *   recentDownloads - downloads by the user in the last hour
  *   recipientKnown  - false = unknown/unregistered recipient (leave undefined when not sharing)
  *   trustedApproved - true when an admin approved the action
  * Returns { score, level, breakdown: [{ factor, points, reason }] }.
  */
-function calculateRisk({ detectedTypes = [], classification = 'PUBLIC', isExternal = false, recentDownloads = 0, recipientKnown, trustedApproved = false } = {}) {
+function calculateRisk({ detectedTypes = [], classification = 'PUBLIC', severity = 'NONE', isExternal = false, recentDownloads = 0, recipientKnown, trustedApproved = false } = {}) {
   const breakdown = [];
   const add = (factor, points, reason) => breakdown.push({ factor, points, reason });
 
@@ -35,6 +36,13 @@ function calculateRisk({ detectedTypes = [], classification = 'PUBLIC', isExtern
   }
   if (recipientKnown === false) add('UNKNOWN_RECIPIENT', W.UNKNOWN_RECIPIENT, 'Recipient is not a registered user');
   if (trustedApproved) add('TRUSTED_APPROVED_ACTION', W.TRUSTED_APPROVED_ACTION, 'Action was approved by an administrator');
+
+  // SECURITY/CONSISTENCY: the additive factors alone cap an upload at 50 even for CRITICAL data
+  // (30 content + 20 classification). Severity is the scanner's verdict, so it sets a floor.
+  // The top-up is listed in `breakdown`, so the score stays fully explainable.
+  const additive = breakdown.reduce((sum, b) => sum + b.points, 0);
+  const floor = SEVERITY_RISK_FLOOR[severity] || 0;
+  if (floor > additive) add('DLP_SEVERITY', floor - additive, `DLP severity ${severity} implies a minimum risk of ${floor}`);
 
   const score = clamp(breakdown.reduce((sum, b) => sum + b.points, 0));
   return { score, level: riskLevel(score), breakdown };

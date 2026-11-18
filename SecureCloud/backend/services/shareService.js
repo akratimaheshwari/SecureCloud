@@ -27,6 +27,10 @@ function evaluateLinkAccess({ link, file, now = new Date() }) {
   if (isDownloadLimitReached(link)) return deny('DOWNLOAD_LIMIT_EXCEEDED', 'The download limit for this link has been reached', 'DOWNLOAD_LIMIT_EXCEEDED');
   if (file && file.status === 'LOCKED') return deny('FILE_LOCKED', 'This file is locked by an administrator', 'FILE_LOCKED_ACCESS');
   if (file && file.status === 'QUARANTINED') return deny('FILE_QUARANTINED', 'This file is quarantined pending security review');
+  if (file && file.status === 'RESTRICTED') return deny('FILE_RESTRICTED', 'This file is restricted by DLP policy and cannot be shared');
+  // Whitelist: a share link only ever serves an ACTIVE file (also covers SCANNING/UPLOADING and links
+  // created while the file was ACTIVE but tightened by a later scan).
+  if (file && file.status !== 'ACTIVE') return deny('FILE_NOT_AVAILABLE', 'This file is not available for sharing');
   return { allowed: true };
 }
 

@@ -5,8 +5,11 @@ const env = require('../config/env');
 const plain = (doc) => (doc && typeof doc.toObject === 'function' ? doc.toObject() : { ...doc });
 
 function serializeFile(file) {
-  const { s3Key, __v, _id, ...rest } = plain(file); // eslint-disable-line no-unused-vars
-  return { id: _id, ...rest };
+  const { s3Key, s3ETag, statusBeforeLock, __v, _id, ...rest } = plain(file); // eslint-disable-line no-unused-vars
+  const out = { id: _id, ...rest };
+  // MEDIUM DLP severity stays ACTIVE but is flagged to the owner
+  if (out.dlpSeverity === 'MEDIUM' && out.status === 'ACTIVE') out.warning = 'Sensitive content (medium severity) was detected in this file';
+  return out;
 }
 
 // includeToken: the secret token / URL is only shown for ACTIVE links (never for blocked/pending ones)

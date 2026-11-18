@@ -12,7 +12,7 @@ function sanitizeFileName(name) {
 // Content-Disposition value with ASCII fallback + RFC 5987 UTF-8 name
 function contentDisposition(name) {
   const ascii = String(name).replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
 }
 
 module.exports = { escapeRegex, sanitizeFileName, contentDisposition };

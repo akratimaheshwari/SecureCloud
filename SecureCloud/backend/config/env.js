@@ -34,6 +34,8 @@ function loadEnv() {
     trustProxy: Number.isNaN(trustProxy) ? false : trustProxy,
     bcryptRounds: Number.parseInt(process.env.BCRYPT_SALT_ROUNDS, 10) || 12,
     maxFileSizeBytes: maxMb * 1024 * 1024,
+    // Optional comma-separated MIME allow-list for uploads; unset = every type accepted (unchanged behaviour)
+    allowedMimeTypes: process.env.ALLOWED_MIME_TYPES ? process.env.ALLOWED_MIME_TYPES.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean) : null,
   });
 }
 

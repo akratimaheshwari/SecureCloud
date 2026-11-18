@@ -49,7 +49,13 @@ async function deleteObject(key) {
 async function headObject(key) {
   try {
     const out = await s3.send(new HeadObjectCommand({ Bucket: env.s3Bucket, Key: key }));
-    return { contentLength: out.ContentLength, contentType: out.ContentType, serverSideEncryption: out.ServerSideEncryption };
+    return {
+      contentLength: out.ContentLength,
+      contentType: out.ContentType,
+      serverSideEncryption: out.ServerSideEncryption,
+      kmsKeyId: out.SSEKMSKeyId,
+      eTag: out.ETag,
+    };
   } catch (err) {
     if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) return null;
     throw err;

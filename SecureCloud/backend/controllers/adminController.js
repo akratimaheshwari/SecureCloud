@@ -26,12 +26,14 @@ const utcDayStart = (daysAgo) => {
 const getStats = asyncHandler(async (req, res) => {
   const since = utcDayStart(13);
 
-  const [totalFiles, highRiskFiles, blockedShares, suspiciousEvents, lockedFiles, bySensitivity, eventsByDay, downloads, decisions] = await Promise.all([
+  const [totalFiles, highRiskFiles, blockedShares, suspiciousEvents, lockedFiles, quarantinedFiles, restrictedFiles, bySensitivity, eventsByDay, downloads, decisions] = await Promise.all([
     File.countDocuments(NOT_DELETED),
     File.countDocuments({ ...NOT_DELETED, riskScore: { $gte: HIGH_RISK_THRESHOLD } }),
     SecurityEvent.countDocuments({ eventType: 'BLOCKED_SHARE' }),
     SecurityEvent.countDocuments({ eventType: { $in: SUSPICIOUS_EVENT_TYPES } }),
     File.countDocuments({ status: 'LOCKED' }),
+    File.countDocuments({ status: 'QUARANTINED' }),
+    File.countDocuments({ status: 'RESTRICTED' }),
     File.aggregate([{ $match: NOT_DELETED }, { $group: { _id: '$classification', count: { $sum: 1 } } }]),
     SecurityEvent.aggregate([
       { $match: { createdAt: { $gte: since } } },
@@ -66,7 +68,7 @@ const getStats = asyncHandler(async (req, res) => {
   };
 
   return sendSuccess(res, {
-    totalFiles, highRiskFiles, blockedShares, suspiciousEvents, lockedFiles,
+    totalFiles, highRiskFiles, blockedShares, suspiciousEvents, lockedFiles, quarantinedFiles, restrictedFiles,
     filesBySensitivity, eventsOverTime, downloadsByUser: downloads, allowedVsBlocked,
   });
 });

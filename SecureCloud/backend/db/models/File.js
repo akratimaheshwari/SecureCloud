@@ -4,7 +4,7 @@ const { Schema } = mongoose;
 
 // Ordered lowest -> highest sensitivity (the policy engine can rank by array index)
 const CLASSIFICATIONS = ['PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'HIGHLY_CONFIDENTIAL'];
-const FILE_STATUSES = ['UPLOADING', 'SCANNING', 'ACTIVE', 'LOCKED', 'QUARANTINED', 'DELETED'];
+const { FILE_STATUSES, SEVERITIES } = require('../../utils/constants'); // single source of truth for statuses
 
 // File metadata only. The bytes live in S3 under `s3Key`.
 const FileSchema = new Schema(
@@ -23,6 +23,15 @@ const FileSchema = new Schema(
     classification: { type: String, enum: CLASSIFICATIONS, default: 'PUBLIC' },
     riskScore: { type: Number, min: 0, max: 100, default: 0 },
     status: { type: String, enum: FILE_STATUSES, default: 'UPLOADING' },
+    // Worst DLP severity ever recorded for this file. Only ever raised, so a later cleaner scan cannot loosen it.
+    dlpSeverity: { type: String, enum: SEVERITIES, default: 'NONE' },
+    // Object identity captured at confirm time; a changed ETag means the S3 object was replaced after the scan.
+    s3ETag: { type: String },
+    // Status held before an admin lock, so unlock restores it (never below what DLP requires).
+    statusBeforeLock: { type: String, enum: FILE_STATUSES },
+    // Set when an administrator released the file from QUARANTINED (it becomes RESTRICTED, never ACTIVE).
+    reviewedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+    reviewedAt: { type: Date },
     lockedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     lockReason: { type: String, trim: true, maxlength: 500 },
   },
